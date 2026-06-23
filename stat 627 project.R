@@ -3,11 +3,16 @@
 
 ## Mapping Food Insecurity: Predictive Modeling of Food Desert Risk Across US Census Tracts
 
-library(dplyr)
 #library(readxl) # using readxl::read_xlsx() with the original Excel file was 
 # not working for me, so I converted the sheet with the data to a CSV file and 
-# used readr::read_csv()
-library(readr)
+# used read.csv()
+library(relaimpo) # relative importance for the linear (forward stepwise) model
+library(pls)     # for principal components regression (pcr)
+library(corrplot)
+library(caret)   # for train/test split and cross-validation utilities
+library(glmnet)
+library(tidyverse)
+library(car)
 
 ## DATA CLEANING
 
@@ -59,9 +64,6 @@ data <- data |>
 data_regression <- replace(data, is.na(data), 0) 
 
 ## EDA 
-library(ggplot2)
-library(corrplot)
-
 # --- Summary statistics for the regression target and key predictors ---
 summary(data_regression$lashare)
 summary(data_regression$MedianFamilyIncome)
@@ -110,8 +112,6 @@ prop.table(table(data_regression$LILATracts_1And10))
 ## REGRESSION MODELING 
 ## Forward stepwise regression vs. principal components regression
 ## Response: lashare (proportion of low-income tract lacking supermarket access)
-library(pls)     # for principal components regression (pcr)
-library(caret)   # for train/test split and cross-validation utilities
 
 set.seed(627)
 
@@ -179,8 +179,6 @@ print(model_comparison)
 
 
 ## VARIABLE IMPORTANCE/INTERPRETABILITY ANALYSIS
-library(relaimpo) # relative importance for the linear (forward stepwise) model
-
 # --- Relative importance of predictors retained in the forward model ---
 # lmg metric: decomposes R^2 by averaging over orderings (Lindeman, Merenda, Gold)
 relimp <- calc.relimp(forward_model, type = "lmg", rela = TRUE)
@@ -208,3 +206,103 @@ ggplot(std_coefs, aes(x = reorder(Predictor, abs(Coefficient)), y = Coefficient)
 # --- Loadings plot for PCR (which original variables drive top components) ---
 loadingplot(pcr_model, comps = 1:2, legendpos = "topleft",
             main = "PCR Loadings: First Two Principal Components")
+
+## Classification modeling
+# LASSO
+# share of occupied housing units with vehicles
+data_classification <- data |>
+  mutate(vehicle_share = 1 - (TractHUNV / OHU2010)) |>
+  select(LILATracts_halfAnd10, PovertyRate, vehicle_share, Urban) |>
+  drop_na()
+
+set.seed(627)
+train <- sample(nrow(data_classification), .8 * nrow(data_classification))
+data_train <- data_classification[train, ]
+
+# poverty rate -> PovertyRate
+# vehicle availability -> vehicle_share
+# population density -> Urban
+# distance to nearest supermarket -> ???
+train_mat <- model.matrix(glm(
+  LILATracts_halfAnd10 ~ PovertyRate + vehicle_share + Urban, 
+  "binomial", 
+  data_train
+))
+data_test <- data_classification[-train, ]
+test_mat <- model.matrix(glm(
+  LILATracts_halfAnd10 ~ PovertyRate + vehicle_share + Urban, 
+  "binomial",
+  data_test
+))
+
+set.seed(627)
+data_lasso <- cv.glmnet(
+  train_mat, 
+  data_train$LILATracts_halfAnd10,
+  family = "binomial",
+  type.measure = "auc"
+)
+
+best_t <- -1
+best_conf_mat <- NULL
+t_pos_rate <- c()
+f_pos_rate <- c()
+for (t in seq(0, 1, .01)) {
+  conf_mat <- confusionMatrix(
+    as.factor(
+      ifelse(predict(data_lasso, newx = test_mat, type = "response") > t, 1, 0)
+    ),
+    data_test$LILATracts_halfAnd10,
+    "1"
+  )
+  best_bal_acc <- ifelse(
+    is.null(best_conf_mat), 
+    -1, 
+    best_conf_mat$byClass[["Balanced Accuracy"]]
+  )
+  t_pos_rate <- c(t_pos_rate, conf_mat$byClass[["Sensitivity"]])
+  f_pos_rate <- c(f_pos_rate, 1 - conf_mat$byClass[["Specificity"]])
+  # prioritize identifying LILA areas
+  if (conf_mat$byClass[["Sensitivity"]] > .95)
+    # do not want to overpredict LILA areas; main measure for comparison
+    if (best_bal_acc < conf_mat$byClass[["Balanced Accuracy"]]) {
+      best_conf_mat <- conf_mat
+      best_t <- t
+    }
+}
+
+# Logit - WINNER
+data_logit <- glm(
+  LILATracts_halfAnd10 ~ PovertyRate + vehicle_share + Urban, 
+  "binomial", 
+  data_train
+)
+vif(data_logit) # multicollinearity check
+
+best_th <- -1
+best_cm <- NULL
+tpr <- c()
+fpr <- c()
+for (th in seq(0, 1, .01)) {
+  cm <- confusionMatrix(
+    as.factor(ifelse(predict(data_logit, data_test, "r") > th, 1, 0)),
+    data_test$LILATracts_halfAnd10,
+    "1"
+  )
+  best_ba <- ifelse(
+    is.null(best_cm),
+    -1, 
+    best_cm$byClass[["Balanced Accuracy"]]
+  )
+  tpr <- c(tpr, cm$byClass[["Sensitivity"]])
+  fpr <- c(fpr, 1 - cm$byClass[["Specificity"]])
+  if (cm$byClass[["Sensitivity"]] > .95)
+    if (best_ba < cm$byClass[["Balanced Accuracy"]]) {
+      best_cm <- cm
+      best_th <- th
+    }
+}
+
+plot(fpr, tpr) # ROC Curve
+best_cm # confusion matrix
+summary(data_logit) # importance based on z-value
