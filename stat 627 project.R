@@ -13,6 +13,7 @@ library(caret)   # for train/test split and cross-validation utilities
 library(glmnet)
 library(tidyverse)
 library(car)
+library(vip)
 
 ## DATA CLEANING
 
@@ -55,13 +56,15 @@ data <- data |>
     across(all_of(numbers), as.numeric), # numerizing numbers
     # low access share. if urban, >0.5 mi. if rural, >10 mi.
     lashare = ifelse(Urban == 1, lapophalf / Pop2010, lapop10 / Pop2010)
-  ) |>
-  filter(LowIncomeTracts == 1) # only looking at low-income tracts
+  )
+
+# Only looking at low-income tracts for regression
+data_li <- filter(data, LowIncomeTracts == 1)
 
 # NOTE: If cells are NA, then the tract is not wide/long enough to be low-access
 # at that threshold. Therefore, the tract technically has 0 low-access people 
 # at that threshold
-data_regression <- replace(data, is.na(data), 0) 
+data_regression <- replace(data_li, is.na(data_li), 0) 
 
 ## EDA 
 # --- Summary statistics for the regression target and key predictors ---
@@ -170,10 +173,10 @@ pcr_rmse <- sqrt(mean((as.vector(pcr_pred) - test_set$lashare)^2))
 
 # --- Model comparison: percentage of variance explained ---
 model_comparison <- data.frame(
-  Model = c("Forward Stepwise", "Principal Components Regression"),
+  Model = c("Forward Stepwise", "PCR"),
   R_squared = c(forward_r2, pcr_r2),
   RMSE = c(forward_rmse, pcr_rmse),
-  N_Predictors = c(length(coef(forward_model)) - 1, ncomp_best)
+  N_Predictors = c(length(coef(forward_model)) - 1, ncomp_best[[1]])
 )
 print(model_comparison)
 
@@ -303,6 +306,7 @@ for (th in seq(0, 1, .01)) {
     }
 }
 
-plot(fpr, tpr) # ROC Curve
-best_cm # confusion matrix
-summary(data_logit) # importance based on z-value
+plot(f_pos_rate, t_pos_rate, main = "Logit ROC Curve", col = "blue") # ROC Curve
+abline(0, 1, col = "red")
+best_conf_mat # confusion matrix
+vip(data_lasso, mapping = aes()) # importance
